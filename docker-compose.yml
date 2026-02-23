@@ -1,0 +1,11 @@
+services:
+  opds:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./books:/books:ro
+    environment:
+      - SERVER_TITLE=My Library
+      - BOOKS_DIR=/books
+    restart: unless-stopped

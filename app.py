@@ -2,6 +2,7 @@ import os
 import glob
 import hashlib
 import re
+import time
 import zipfile
 import io
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ app = Flask(__name__)
 
 BOOKS_DIR = os.environ.get("BOOKS_DIR", "/books")
 SERVER_TITLE = os.environ.get("SERVER_TITLE", "OPDS Library")
+SCAN_TTL = int(os.environ.get("SCAN_TTL", 300))  # seconds before rescanning
 
 MIME_TYPES = {
     ".epub": "application/epub+zip",
@@ -29,18 +31,30 @@ MIME_TYPES = {
 # Simple in-memory cover cache: book_id -> (image_bytes, mime_type) or None
 _cover_cache = {}
 
+# Book scan cache
+_scan_cache: list = []
+_scan_time: float = 0.0
+# book_id -> path for fast cover lookups
+_book_paths: dict = {}
+
 
 def base_url():
     return request.url_root.rstrip("/")
 
 
 def scan_books():
+    global _scan_cache, _scan_time, _book_paths
+    if time.monotonic() - _scan_time < SCAN_TTL:
+        return _scan_cache
     books = []
     for ext in MIME_TYPES:
         pattern = os.path.join(BOOKS_DIR, f"**/*{ext}")
         for path in glob.glob(pattern, recursive=True):
             books.append(path)
-    books.sort()
+    books.sort(key=os.path.getmtime, reverse=True)
+    _book_paths = {hashlib.md5(p.encode()).hexdigest(): p for p in books}
+    _scan_cache = books
+    _scan_time = time.monotonic()
     return books
 
 
@@ -138,16 +152,15 @@ def book_to_entry(path):
     download_url = f"{base_url()}/download/{quote(rel)}"
     cover_url = f"{base_url()}/cover/{book_id}"
 
-    cover = get_cover(book_id, path)
+    # Only include cover links for epub files; cover is fetched lazily on demand
     cover_links = ""
-    if cover:
-        _, cover_mime = cover
+    if ext == ".epub":
         cover_links = f"""    <link rel="http://opds-spec.org/image"
           href="{escape(cover_url)}"
-          type="{cover_mime}"/>
+          type="image/jpeg"/>
     <link rel="http://opds-spec.org/image/thumbnail"
           href="{escape(cover_url)}"
-          type="{cover_mime}"/>
+          type="image/jpeg"/>
 """
 
     return f"""  <entry>
@@ -194,16 +207,14 @@ def catalog():
 
 @app.route("/cover/<book_id>")
 def cover(book_id):
-    # Find the book by id
-    books = scan_books()
-    for path in books:
-        bid = hashlib.md5(path.encode()).hexdigest()
-        if bid == book_id:
-            result = get_cover(book_id, path)
-            if result:
-                data, mime = result
-                return Response(data, mimetype=mime)
-            abort(404)
+    scan_books()  # ensure _book_paths is populated
+    path = _book_paths.get(book_id)
+    if not path:
+        abort(404)
+    result = get_cover(book_id, path)
+    if result:
+        data, mime = result
+        return Response(data, mimetype=mime)
     abort(404)
 
 

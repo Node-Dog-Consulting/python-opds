@@ -1,10 +1,10 @@
 import os
 import glob
 import hashlib
+import json
 import re
 import time
 import zipfile
-import io
 from datetime import datetime, timezone
 from urllib.parse import quote
 from xml.sax.saxutils import escape
@@ -15,7 +15,12 @@ app = Flask(__name__)
 
 BOOKS_DIR = os.environ.get("BOOKS_DIR", "/books")
 SERVER_TITLE = os.environ.get("SERVER_TITLE", "OPDS Library")
-SCAN_TTL = int(os.environ.get("SCAN_TTL", 300))  # seconds before rescanning
+SCAN_TTL = int(os.environ.get("SCAN_TTL", 60))  # seconds before rescanning
+CACHE_DIR = os.environ.get("CACHE_DIR", "/cache")
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+SCAN_CACHE_FILE = os.path.join(CACHE_DIR, "scan.json")
 
 MIME_TYPES = {
     ".epub": "application/epub+zip",
@@ -28,10 +33,7 @@ MIME_TYPES = {
     ".cbr": "application/vnd.comicbook-rar",
 }
 
-# Simple in-memory cover cache: book_id -> (image_bytes, mime_type) or None
-_cover_cache = {}
-
-# Book scan cache
+# Book scan cache (in-process, populated from filesystem cache or full scan)
 _scan_cache: list = []
 _scan_time: float = 0.0
 # book_id -> path for fast cover lookups
@@ -44,8 +46,24 @@ def base_url():
 
 def scan_books():
     global _scan_cache, _scan_time, _book_paths
-    if time.monotonic() - _scan_time < SCAN_TTL:
+    now = time.monotonic()
+    if now - _scan_time < SCAN_TTL and _scan_cache:
         return _scan_cache
+
+    # Try filesystem cache before doing a full directory scan
+    try:
+        with open(SCAN_CACHE_FILE) as f:
+            data = json.load(f)
+        if time.time() - data["timestamp"] < SCAN_TTL:
+            books = [p for p in data["books"] if os.path.exists(p)]
+            _book_paths = {hashlib.md5(p.encode()).hexdigest(): p for p in books}
+            _scan_cache = books
+            _scan_time = now
+            return books
+    except Exception:
+        pass
+
+    # Full scan
     books = []
     for ext in MIME_TYPES:
         pattern = os.path.join(BOOKS_DIR, f"**/*{ext}")
@@ -54,7 +72,14 @@ def scan_books():
     books.sort(key=os.path.getmtime, reverse=True)
     _book_paths = {hashlib.md5(p.encode()).hexdigest(): p for p in books}
     _scan_cache = books
-    _scan_time = time.monotonic()
+    _scan_time = now
+
+    try:
+        with open(SCAN_CACHE_FILE, "w") as f:
+            json.dump({"timestamp": time.time(), "books": books}, f)
+    except Exception:
+        pass
+
     return books
 
 
@@ -132,13 +157,37 @@ def extract_epub_cover(epub_path):
 
 
 def get_cover(book_id, path):
-    if book_id not in _cover_cache:
-        ext = os.path.splitext(path)[1].lower()
-        if ext == ".epub":
-            _cover_cache[book_id] = extract_epub_cover(path)
-        else:
-            _cover_cache[book_id] = None
-    return _cover_cache[book_id]
+    # Check filesystem cache
+    for cache_ext, mime in ((".jpg", "image/jpeg"), (".png", "image/png")):
+        cached = os.path.join(CACHE_DIR, book_id + cache_ext)
+        if os.path.exists(cached):
+            with open(cached, "rb") as f:
+                return f.read(), mime
+
+    # Sentinel: cover was already looked up and not found
+    if os.path.exists(os.path.join(CACHE_DIR, book_id + ".none")):
+        return None
+
+    # Extract cover
+    result = None
+    if os.path.splitext(path)[1].lower() == ".epub":
+        result = extract_epub_cover(path)
+
+    if result:
+        data, mime = result
+        cache_ext = ".png" if mime == "image/png" else ".jpg"
+        try:
+            with open(os.path.join(CACHE_DIR, book_id + cache_ext), "wb") as f:
+                f.write(data)
+        except Exception:
+            pass
+        return data, mime
+
+    try:
+        open(os.path.join(CACHE_DIR, book_id + ".none"), "w").close()
+    except Exception:
+        pass
+    return None
 
 
 def book_to_entry(path):

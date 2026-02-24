@@ -5,6 +5,7 @@ services:
       - "8080:8080"
     volumes:
       - ./books:/books:ro
+      - ./cache:/cache
     environment:
       - SERVER_TITLE=My Library
       - BOOKS_DIR=/books
